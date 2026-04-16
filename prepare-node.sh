@@ -28,7 +28,7 @@ IFS=$'\n\t'
 #  Constants
 # ══════════════════════════════════════════════════════════════════════════════
 
-readonly SCRIPT_VERSION="1.0.2"
+readonly SCRIPT_VERSION="1.1.0"
 readonly SCRIPT_NAME="prepare-node.sh"
 
 readonly STATE_DIR="/var/lib/node-prep"
@@ -41,6 +41,14 @@ readonly REPORT_FILE="/root/node-prep-report.txt"
 readonly SSHD_BACKUP="/etc/ssh/sshd_config.prep.bak"
 readonly LOG_FILE="/var/log/node-prep.log"
 
+readonly SYSCTL_FILE="/etc/sysctl.d/99-node-prep.conf"
+readonly LIMITS_FILE="/etc/security/limits.d/99-node-prep.conf"
+readonly JOURNALD_DROPIN="/etc/systemd/journald.conf.d/90-node-prep.conf"
+readonly NEEDRESTART_DROPIN="/etc/needrestart/conf.d/90-node-prep.conf"
+readonly APT_NO_REBOOT="/etc/apt/apt.conf.d/90-node-prep-no-reboot"
+readonly NFCONNTRACK_MODLOAD="/etc/modules-load.d/nf_conntrack.conf"
+readonly DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
+
 # Packages to install on every node (both ru-node and exit)
 readonly BASE_PACKAGES=(
     # System utilities
@@ -51,10 +59,14 @@ readonly BASE_PACKAGES=(
     net-tools iproute2 dnsutils
     tcpdump mtr-tiny traceroute
     rsync unzip tar lsof strace
+    bash-completion
     # Security
     nftables fail2ban unattended-upgrades gnupg
+    haveged
     # Infrastructure
     chrony logrotate rsyslog cron sudo
+    # For AWG PPA (install.sh will `add-apt-repository ppa:amnezia/ppa`)
+    software-properties-common python3-launchpadlib
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -76,6 +88,9 @@ GENERATED_CLAUDE_PRIVKEY=""
 GENERATED_CLAUDE_PUBKEY=""
 ADMIN_PASSWORD_NEW=""
 SSHD_CHANGED=false
+TOTAL_STEPS=12          # 12 for exit, 13 for ru-node (set in main)
+HARDENING_APPLIED=""
+DOCKER_STATUS=""
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Logging / output helpers
@@ -103,8 +118,6 @@ run() {
 }
 
 # Run a command quietly: redirect both stdout and stderr to $LOG_FILE.
-# Used for noisy commands (apt, unattended-upgrade) to keep the main stdout
-# clean for the final report.
 run_quiet() {
     if [[ "$DRY_RUN" == "true" ]]; then
         printf '[DRY-RUN] would run (quiet): %s\n' "$*" >&2
@@ -167,7 +180,6 @@ parse_args() {
         esac
     done
 
-    # Validate required
     if [[ -z "$ROLE" ]]; then
         err "--role is required"; usage; exit 1
     fi
@@ -176,20 +188,31 @@ parse_args() {
         *) die "Invalid --role '$ROLE' (must be 'ru-node' or 'exit')" 1 ;;
     esac
 
-    # Validate hostname format
     if [[ -n "$HOSTNAME_NEW" ]]; then
         if ! [[ "$HOSTNAME_NEW" =~ ^[a-z][a-z0-9-]{0,62}$ ]]; then
             die "Invalid --hostname: must match [a-z][a-z0-9-]{0,62}" 1
         fi
     fi
 
-    # Basic sanity on pubkeys (not validating the full format, just prefix)
     if [[ -n "$ADMIN_PUBKEY" ]] && ! [[ "$ADMIN_PUBKEY" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-) ]]; then
         die "--admin-pubkey does not look like a valid ssh public key" 1
     fi
     if [[ -n "$CLAUDE_PUBKEY" ]] && ! [[ "$CLAUDE_PUBKEY" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-) ]]; then
         die "--claude-pubkey does not look like a valid ssh public key" 1
     fi
+
+    # Total steps depends on role (Docker is ru-node only)
+    if [[ "$ROLE" == "ru-node" ]]; then
+        TOTAL_STEPS=13
+    else
+        TOTAL_STEPS=12
+    fi
+}
+
+# Helper: "Step N/TOTAL: title"
+step() {
+    local n="$1" title="$2"
+    log "Step ${n}/${TOTAL_STEPS}: ${title}"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -197,14 +220,12 @@ parse_args() {
 # ══════════════════════════════════════════════════════════════════════════════
 
 pre_checks() {
-    log "Step 1/11: Pre-checks"
+    step 1 "Pre-checks"
 
-    # root?
     if [[ $EUID -ne 0 ]]; then
         die "Must be run as root (try: sudo bash $SCRIPT_NAME ...)" 2
     fi
 
-    # Ubuntu 24.04?
     if [[ ! -f /etc/os-release ]]; then
         die "/etc/os-release not found — unsupported OS" 2
     fi
@@ -214,30 +235,24 @@ pre_checks() {
         die "Unsupported OS: ${ID:-?} ${VERSION_ID:-?} (required: ubuntu 24.04)" 2
     fi
 
-    # Internet reachability (best-effort, no-fail)
     if ! curl -fsS --max-time 5 --head https://deb.debian.org >/dev/null 2>&1; then
         warn "Internet reachability check failed (HTTPS to deb.debian.org). Continuing."
     fi
 
-    # State dir
     run mkdir -p "$STATE_DIR"
     run chmod 700 "$STATE_DIR"
-
-    # Touch log file
     run touch "$LOG_FILE"
 
-    # Bump run counter
     local count=0
     [[ -f "$RUN_COUNT_FILE" ]] && count=$(cat "$RUN_COUNT_FILE" 2>/dev/null || echo 0)
     count=$((count + 1))
     [[ "$DRY_RUN" == "false" ]] && echo "$count" > "$RUN_COUNT_FILE"
 
-    # First-run timestamp
     if [[ ! -f "$FIRST_RUN_TS_FILE" && "$DRY_RUN" == "false" ]]; then
         _ts > "$FIRST_RUN_TS_FILE"
     fi
 
-    ok "Pre-checks passed (run #$count, Ubuntu ${VERSION_ID})"
+    ok "Pre-checks passed (run #$count, Ubuntu ${VERSION_ID}, role=${ROLE})"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -245,7 +260,7 @@ pre_checks() {
 # ══════════════════════════════════════════════════════════════════════════════
 
 set_hostname() {
-    log "Step 2/11: Hostname"
+    step 2 "Hostname"
 
     if [[ -z "$HOSTNAME_NEW" ]]; then
         log "  (skipped: --hostname not provided; current: $(hostname))"
@@ -260,7 +275,6 @@ set_hostname() {
 
     run hostnamectl set-hostname "$HOSTNAME_NEW"
 
-    # Update /etc/hosts
     if [[ "$DRY_RUN" == "false" ]]; then
         if grep -qE "^127\.0\.1\.1\s" /etc/hosts; then
             sed -i -E "s|^127\.0\.1\.1\s+.*$|127.0.1.1\t${HOSTNAME_NEW}|" /etc/hosts
@@ -277,13 +291,12 @@ set_hostname() {
 # ══════════════════════════════════════════════════════════════════════════════
 
 apt_update_security() {
-    log "Step 3/11: apt update + security upgrades"
+    step 3 "apt update + security upgrades"
     log "  (apt output suppressed; see $LOG_FILE for details)"
 
     export DEBIAN_FRONTEND=noninteractive
     run_quiet apt-get update -qq
 
-    # Security upgrades (best-effort; continue on failure)
     if command -v unattended-upgrade >/dev/null 2>&1; then
         run_quiet unattended-upgrade || warn "unattended-upgrade returned non-zero"
     else
@@ -298,12 +311,11 @@ apt_update_security() {
 # ══════════════════════════════════════════════════════════════════════════════
 
 install_base_software() {
-    log "Step 4/11: Install base software (${#BASE_PACKAGES[@]} packages)"
+    step 4 "Install base software (${#BASE_PACKAGES[@]} packages)"
     log "  (apt output suppressed; see $LOG_FILE for details, may take 1-3 min)"
 
     export DEBIAN_FRONTEND=noninteractive
 
-    # Install all at once (faster, apt handles deps together)
     if [[ "$DRY_RUN" == "false" ]]; then
         apt-get install -yqq --no-install-recommends \
             -o Dpkg::Use-Pty=0 \
@@ -313,7 +325,6 @@ install_base_software() {
         printf '[DRY-RUN] would install: %s\n' "${BASE_PACKAGES[*]}" >&2
     fi
 
-    # Verify each package
     for pkg in "${BASE_PACKAGES[@]}"; do
         local ver
         if [[ "$DRY_RUN" == "true" ]]; then
@@ -335,25 +346,178 @@ install_base_software() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Step 5 — chrony
+#  Step 5 — System hardening (sysctl / ulimits / tz / journald / needrestart / ufw)
+# ══════════════════════════════════════════════════════════════════════════════
+
+apply_system_hardening() {
+    step 5 "System hardening (sysctl, ulimits, TZ, journald, needrestart, UFW)"
+
+    local parts=()
+
+    # ── Timezone → UTC ────────────────────────────────────────────────────────
+    if [[ "$DRY_RUN" == "false" ]]; then
+        timedatectl set-timezone UTC 2>/dev/null || warn "timedatectl failed"
+    fi
+    parts+=("tz=UTC")
+
+    # ── nf_conntrack module + autoload ────────────────────────────────────────
+    if [[ "$DRY_RUN" == "false" ]]; then
+        modprobe nf_conntrack 2>/dev/null || warn "modprobe nf_conntrack failed"
+        echo "nf_conntrack" > "$NFCONNTRACK_MODLOAD"
+    fi
+
+    # ── sysctl: performance + security + IPv6 baseline (host-level, not
+    #    role-specific — install.sh adds ip_forward / forwarding / rp_filter) ──
+    if [[ "$DRY_RUN" == "false" ]]; then
+        cat > "$SYSCTL_FILE" <<SYSCTL
+# Generated by prepare-node.sh v${SCRIPT_VERSION} at $(_ts)
+# Host-level tuning & hardening. Role-specific sysctl (ip_forward,
+# ipv6.forwarding, rp_filter) is applied later by install.sh.
+
+# ── Performance tuning (VPN node, ~100 clients) ──
+fs.file-max = 500000
+net.core.somaxconn = 4096
+net.core.netdev_max_backlog = 16384
+net.core.rmem_default = 262144
+net.core.rmem_max = 16777216
+net.core.wmem_default = 262144
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq
+net.netfilter.nf_conntrack_max = 262144
+
+# ── Security baseline (CIS-aligned) ──
+net.ipv4.tcp_syncookies = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_source_route = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+fs.suid_dumpable = 0
+
+# ── IPv6 privacy / RA (servers use static, not autoconf) ──
+net.ipv6.conf.all.accept_ra = 0
+net.ipv6.conf.default.accept_ra = 0
+net.ipv6.conf.all.use_tempaddr = 0
+net.ipv6.conf.default.use_tempaddr = 0
+SYSCTL
+        chmod 644 "$SYSCTL_FILE"
+        # Apply; ignore failures on individual keys (e.g., nf_conntrack not loaded yet)
+        sysctl -p "$SYSCTL_FILE" >>"$LOG_FILE" 2>&1 || warn "some sysctl keys failed (see $LOG_FILE)"
+    fi
+    parts+=("sysctl")
+
+    # ── ulimits ───────────────────────────────────────────────────────────────
+    if [[ "$DRY_RUN" == "false" ]]; then
+        cat > "$LIMITS_FILE" <<LIMITS
+# Generated by prepare-node.sh v${SCRIPT_VERSION}
+* soft nofile 65535
+* hard nofile 65535
+* soft nproc 8192
+* hard nproc 8192
+root soft nofile 65535
+root hard nofile 65535
+root soft nproc unlimited
+root hard nproc unlimited
+LIMITS
+        chmod 644 "$LIMITS_FILE"
+    fi
+    parts+=("ulimits")
+
+    # ── journald limits ──────────────────────────────────────────────────────
+    if [[ "$DRY_RUN" == "false" ]]; then
+        mkdir -p "$(dirname "$JOURNALD_DROPIN")"
+        cat > "$JOURNALD_DROPIN" <<'JOURNALD'
+[Journal]
+SystemMaxUse=1G
+SystemMaxFileSize=100M
+MaxFileSec=1week
+Compress=yes
+JOURNALD
+        systemctl restart systemd-journald 2>/dev/null || warn "journald restart failed"
+    fi
+    parts+=("journald=1G")
+
+    # ── needrestart: non-interactive ─────────────────────────────────────────
+    if command -v needrestart >/dev/null 2>&1; then
+        if [[ "$DRY_RUN" == "false" ]]; then
+            mkdir -p "$(dirname "$NEEDRESTART_DROPIN")"
+            cat > "$NEEDRESTART_DROPIN" <<'NRCONF'
+# Generated by prepare-node.sh: automatic service restart, no prompts
+$nrconf{restart} = 'a';
+$nrconf{kernelhints} = 0;
+NRCONF
+        fi
+        parts+=("needrestart=auto")
+    fi
+
+    # ── unattended-upgrades: disable auto-reboot ─────────────────────────────
+    if [[ "$DRY_RUN" == "false" ]]; then
+        cat > "$APT_NO_REBOOT" <<'APTNR'
+// Generated by prepare-node.sh: never auto-reboot after kernel upgrades.
+// Reboots are scheduled manually via ops runbook.
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
+APTNR
+    fi
+    parts+=("no-auto-reboot")
+
+    # ── UFW disable if present/active ────────────────────────────────────────
+    local ufw_result="not-present"
+    if command -v ufw >/dev/null 2>&1; then
+        if systemctl is-active --quiet ufw 2>/dev/null; then
+            if [[ "$DRY_RUN" == "false" ]]; then
+                ufw --force disable >>"$LOG_FILE" 2>&1 || true
+                systemctl disable --now ufw >>"$LOG_FILE" 2>&1 || true
+            fi
+            ufw_result="disabled"
+            parts+=("ufw=disabled")
+        else
+            ufw_result="present-inactive"
+        fi
+    fi
+
+    HARDENING_APPLIED=$(IFS=,; echo "${parts[*]}")
+    ok "System hardening applied: $HARDENING_APPLIED (ufw=$ufw_result)"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Step 6 — chrony
 # ══════════════════════════════════════════════════════════════════════════════
 
 setup_chrony() {
-    log "Step 5/11: chrony (time sync)"
+    step 6 "chrony (time sync)"
     run systemctl enable --now chrony
     ok "chrony enabled and running"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Step 6 — nftables (firewall)
+#  Step 7 — nftables (firewall)
 # ══════════════════════════════════════════════════════════════════════════════
 
 setup_nftables() {
-    log "Step 6/11: nftables baseline"
+    step 7 "nftables baseline"
 
     local ssh_rule
     if [[ -n "$OFFICE_IPS" ]]; then
-        # Build saddr set from CSV. Separate v4 and v6.
         local v4_set="" v6_set=""
         IFS=',' read -ra IPS <<< "$OFFICE_IPS"
         for ip in "${IPS[@]}"; do
@@ -406,11 +570,9 @@ ${ssh_rule}
 }
 NFT
         chmod 644 "$conf"
-        # Validate syntax before applying
         if ! nft -c -f "$conf"; then
             die "nftables ruleset syntax error in $conf" 3
         fi
-        # Apply atomically
         nft -f "$conf"
         systemctl enable --now nftables
     fi
@@ -422,11 +584,11 @@ NFT
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Step 7 — fail2ban
+#  Step 8 — fail2ban
 # ══════════════════════════════════════════════════════════════════════════════
 
 setup_fail2ban() {
-    log "Step 7/11: fail2ban"
+    step 8 "fail2ban"
 
     local jail_local="/etc/fail2ban/jail.local"
     if [[ "$DRY_RUN" == "false" ]]; then
@@ -445,15 +607,14 @@ F2B
     fi
 
     run systemctl enable --now fail2ban
-    run systemctl restart fail2ban  # pick up jail.local
+    run systemctl restart fail2ban
     ok "fail2ban configured (sshd jail: maxretry=5, bantime=1h)"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Step 8 — User: admin
+#  Step 9 — User: admin
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Generate password: 16 chars from A-HJ-NP-Za-km-z2-9 (no confusing 0 O 1 l I)
 gen_password() {
     local chars='A-HJ-NP-Za-km-z2-9'
     local pass=""
@@ -465,7 +626,7 @@ gen_password() {
 }
 
 create_user_admin() {
-    log "Step 8/11: User 'admin'"
+    step 9 "User 'admin'"
 
     if ! id -u admin >/dev/null 2>&1; then
         run useradd -m -s /bin/bash -c "Operator (human admin)" admin
@@ -474,12 +635,10 @@ create_user_admin() {
         log "  User 'admin' already exists"
     fi
 
-    # Password: generate only once on first prep run
     if [[ ! -f "$MARKER_ADMIN" ]]; then
         ADMIN_PASSWORD_NEW=$(gen_password)
         if [[ "$DRY_RUN" == "false" ]]; then
             echo "admin:${ADMIN_PASSWORD_NEW}" | chpasswd
-            # Persist for report on re-runs
             umask 077
             echo "$ADMIN_PASSWORD_NEW" > "$ADMIN_PASSWORD_FILE"
             chmod 600 "$ADMIN_PASSWORD_FILE"
@@ -495,7 +654,6 @@ create_user_admin() {
         log "  admin password preserved from first run"
     fi
 
-    # Install admin pubkey if provided
     if [[ -n "$ADMIN_PUBKEY" && "$DRY_RUN" == "false" ]]; then
         install -d -o admin -g admin -m 700 /home/admin/.ssh
         echo "$ADMIN_PUBKEY" > /home/admin/.ssh/authorized_keys
@@ -503,7 +661,6 @@ create_user_admin() {
         chmod 600 /home/admin/.ssh/authorized_keys
     fi
 
-    # sudoers: admin ALL=(ALL) ALL (with password)
     if [[ "$DRY_RUN" == "false" ]]; then
         echo 'admin ALL=(ALL) ALL' > /etc/sudoers.d/admin
         chmod 440 /etc/sudoers.d/admin
@@ -514,11 +671,11 @@ create_user_admin() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Step 9 — User: claude
+#  Step 10 — User: claude
 # ══════════════════════════════════════════════════════════════════════════════
 
 create_user_claude() {
-    log "Step 9/11: User 'claude'"
+    step 10 "User 'claude'"
 
     if ! id -u claude >/dev/null 2>&1; then
         run useradd -m -s /bin/bash -c "Automation user (Claude)" claude
@@ -527,15 +684,12 @@ create_user_claude() {
         log "  User 'claude' already exists"
     fi
 
-    # Lock password regardless
     run passwd -l claude >/dev/null
 
-    # Ensure .ssh directory
     if [[ "$DRY_RUN" == "false" ]]; then
         install -d -o claude -g claude -m 700 /home/claude/.ssh
     fi
 
-    # Pubkey: provided or generate
     local pub_line=""
     if [[ -n "$CLAUDE_PUBKEY" ]]; then
         pub_line="$CLAUDE_PUBKEY"
@@ -544,15 +698,14 @@ create_user_claude() {
             chown claude:claude /home/claude/.ssh/authorized_keys
             chmod 600 /home/claude/.ssh/authorized_keys
         fi
-        GENERATED_CLAUDE_PRIVKEY=""  # not generated; not shown in report
+        GENERATED_CLAUDE_PRIVKEY=""
         GENERATED_CLAUDE_PUBKEY="$pub_line"
         ok "claude pubkey installed (provided via --claude-pubkey)"
     else
-        # Generate ed25519 pair — only if one doesn't already exist (idempotency)
         local key_path="/home/claude/.ssh/id_ed25519"
         if [[ -f "$key_path" && "$DRY_RUN" == "false" ]]; then
             pub_line=$(cat "${key_path}.pub")
-            GENERATED_CLAUDE_PRIVKEY=""  # Do not re-show on re-runs
+            GENERATED_CLAUDE_PRIVKEY=""
             GENERATED_CLAUDE_PUBKEY="$pub_line"
             log "  claude keypair already exists, re-using (privkey not shown)"
         elif [[ "$DRY_RUN" == "false" ]]; then
@@ -572,7 +725,6 @@ create_user_claude() {
         fi
     fi
 
-    # sudoers: NOPASSWD for automation
     if [[ "$DRY_RUN" == "false" ]]; then
         echo 'claude ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/claude
         chmod 440 /etc/sudoers.d/claude
@@ -583,10 +735,9 @@ create_user_claude() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Step 10 — SSH hardening
+#  Step 11 — SSH hardening
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Set sshd_config option, idempotently. Adds if missing.
 set_sshd_option() {
     local key="$1" val="$2" file="/etc/ssh/sshd_config"
     if grep -qE "^\s*#?\s*${key}\b" "$file"; then
@@ -597,28 +748,28 @@ set_sshd_option() {
 }
 
 harden_ssh() {
-    log "Step 10/11: SSH hardening"
+    step 11 "SSH hardening"
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        log "  [DRY-RUN] would set PermitRootLogin no, PasswordAuthentication yes, add Match claude block"
+        log "  [DRY-RUN] would harden sshd_config + Match claude block"
         return
     fi
 
-    # Backup
     cp -a /etc/ssh/sshd_config "$SSHD_BACKUP"
-    SSHD_CHANGED=true  # we have a backup; cleanup trap may use it
+    SSHD_CHANGED=true
 
-    # Apply options
-    set_sshd_option "PermitRootLogin"        "no"
-    set_sshd_option "PasswordAuthentication" "yes"
-    set_sshd_option "PubkeyAuthentication"   "yes"
+    set_sshd_option "PermitRootLogin"                "no"
+    set_sshd_option "PasswordAuthentication"         "yes"
+    set_sshd_option "PubkeyAuthentication"           "yes"
     set_sshd_option "ChallengeResponseAuthentication" "no"
-    set_sshd_option "UsePAM"                 "yes"
-    set_sshd_option "X11Forwarding"          "no"
-    set_sshd_option "MaxAuthTries"           "3"
-    set_sshd_option "LoginGraceTime"         "30s"
+    set_sshd_option "UsePAM"                         "yes"
+    set_sshd_option "X11Forwarding"                  "no"
+    set_sshd_option "MaxAuthTries"                   "3"
+    set_sshd_option "LoginGraceTime"                 "30s"
+    set_sshd_option "ClientAliveInterval"            "300"
+    set_sshd_option "ClientAliveCountMax"            "2"
+    set_sshd_option "AllowAgentForwarding"           "no"
 
-    # Match User claude block — add only if not present
     if ! grep -qE "^\s*Match\s+User\s+claude\b" /etc/ssh/sshd_config; then
         cat >> /etc/ssh/sshd_config <<'SSHD_CLAUDE'
 
@@ -629,7 +780,6 @@ Match User claude
 SSHD_CLAUDE
     fi
 
-    # Validate syntax
     if ! sshd -t 2>/tmp/sshd-t.err; then
         err "sshd -t failed. Restoring backup."
         cp -a "$SSHD_BACKUP" /etc/ssh/sshd_config
@@ -637,13 +787,77 @@ SSHD_CLAUDE
         die "SSH config validation failed" 5
     fi
 
-    # Lock root password
     passwd -l root >/dev/null
 
-    # Reload (NOT restart — keeps current session alive)
     systemctl reload ssh || systemctl restart ssh
 
-    ok "SSH hardened (root disabled, claude pubkey-only, validated)"
+    ok "SSH hardened (root off, claude pubkey-only, ClientAlive=300/2, validated)"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Step 12 — Docker (ru-node only)
+# ══════════════════════════════════════════════════════════════════════════════
+
+install_docker() {
+    step 12 "Docker + Compose (ru-node only)"
+
+    if [[ "$ROLE" != "ru-node" ]]; then
+        log "  Skipped (role=$ROLE)"
+        DOCKER_STATUS="skipped"
+        return
+    fi
+
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+        local dv cv
+        dv=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')
+        cv=$(docker compose version --short 2>/dev/null)
+        log "  Docker already installed (docker=$dv, compose=$cv)"
+    else
+        log "  Installing Docker via https://get.docker.com (suppressed output)"
+        if [[ "$DRY_RUN" == "false" ]]; then
+            curl -fsSL https://get.docker.com -o /tmp/get-docker.sh >>"$LOG_FILE" 2>&1
+            sh /tmp/get-docker.sh >>"$LOG_FILE" 2>&1 \
+                || warn "Docker install script returned non-zero (see $LOG_FILE)"
+            rm -f /tmp/get-docker.sh
+        fi
+    fi
+
+    # Docker daemon.json — log limits + live-restore
+    if [[ "$DRY_RUN" == "false" && ! -f "$DOCKER_DAEMON_JSON" ]]; then
+        mkdir -p "$(dirname "$DOCKER_DAEMON_JSON")"
+        cat > "$DOCKER_DAEMON_JSON" <<'DAEMON'
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  },
+  "live-restore": true,
+  "userland-proxy": false
+}
+DAEMON
+        chmod 644 "$DOCKER_DAEMON_JSON"
+        systemctl restart docker 2>/dev/null \
+            || warn "docker restart failed (may need manual review)"
+    fi
+
+    if [[ "$DRY_RUN" == "false" ]]; then
+        systemctl enable --now docker >>"$LOG_FILE" 2>&1 \
+            || warn "systemctl enable docker failed"
+    fi
+
+    # Final status
+    if [[ "$DRY_RUN" == "false" ]] && command -v docker >/dev/null 2>&1; then
+        local dv cv st
+        dv=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',' || echo "?")
+        cv=$(docker compose version --short 2>/dev/null || echo "?")
+        st=$(systemctl is-active docker 2>/dev/null || echo "?")
+        DOCKER_STATUS="${st} (d=${dv}, c=${cv})"
+        ok "Docker $st, docker=$dv, compose=$cv"
+    else
+        DOCKER_STATUS="dry-run"
+        log "  (dry-run: no changes made)"
+    fi
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -662,8 +876,7 @@ get_ipv4_addr() {
 
 get_ipv6_addr() {
     local iface="$1"
-    ip -6 -o addr show dev "$iface" scope global 2>/dev/null \
-        | awk '{print $4; exit}'
+    ip -6 -o addr show dev "$iface" scope global 2>/dev/null | awk '{print $4; exit}'
 }
 
 get_gw_v4() { ip -4 route show default 2>/dev/null | awk '{print $3; exit}'; }
@@ -677,7 +890,6 @@ get_resolvers() {
         src=/etc/resolv.conf
     fi
     [[ -z "$src" ]] && return
-    # Deduplicate preserving order
     awk '/^nameserver/ && !seen[$2]++ {print $2}' "$src" | paste -sd ',' -
 }
 
@@ -699,7 +911,6 @@ get_cpu_mhz() {
     local mhz
     mhz=$(lscpu | awk -F: '/CPU max MHz|CPU MHz/ {sub(/^[ \t]+/, "", $2); print int($2); exit}')
     if [[ -z "$mhz" || "$mhz" == "0" ]]; then
-        # Fallback: read from /proc/cpuinfo (some virtualized CPUs miss it in lscpu)
         mhz=$(awk '/cpu MHz/ {print int($4); exit}' /proc/cpuinfo)
     fi
     echo "${mhz:-unknown}"
@@ -736,17 +947,10 @@ get_distro() {
 
 get_chrony_synced() {
     if ! command -v chronyc >/dev/null 2>&1; then echo "chrony not installed"; return; fi
-    local out
+    local out leap
     out=$(chronyc tracking 2>/dev/null || true)
-    local offset
-    offset=$(echo "$out" | awk '/System time/ {print $4" "$5}')
-    local leap
-    leap=$(echo "$out" | awk -F: '/Leap status/ {gsub(/^[ \t]+/, "", $2); print $2}')
-    if echo "$leap" | grep -qi "Normal"; then
-        echo "yes (offset: ${offset:-?})"
-    else
-        echo "no (leap: ${leap:-?})"
-    fi
+    leap=$(echo "$out" | awk -F: '/Leap status/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')
+    if echo "$leap" | grep -qi "Normal"; then echo "yes"; else echo "no (leap:${leap:-?})"; fi
 }
 
 get_fpr() {
@@ -769,11 +973,11 @@ get_fail2ban_banned() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Step 11 — Generate report
+#  Step 13/12 — Generate report
 # ══════════════════════════════════════════════════════════════════════════════
 
 generate_report() {
-    log "Step 11/11: Generate report"
+    step "$TOTAL_STEPS" "Generate report"
 
     local iface; iface=$(get_primary_iface)
     local ipv4;  ipv4=$(get_ipv4_addr "$iface")
@@ -781,7 +985,7 @@ generate_report() {
     local ipv6_prefix; ipv6_prefix="$(echo "$ipv6" | sed -E 's|::[0-9a-f:]*/|::/|')"
     local first_ts; first_ts=$(cat "$FIRST_RUN_TS_FILE" 2>/dev/null || echo "n/a")
     local run_count; run_count=$(cat "$RUN_COUNT_FILE" 2>/dev/null || echo 1)
-    local claude_pub_line; claude_pub_line="$GENERATED_CLAUDE_PUBKEY"
+    local claude_pub_line="$GENERATED_CLAUDE_PUBKEY"
     local claude_fpr="n/a"
     if [[ -f /home/claude/.ssh/id_ed25519.pub ]]; then
         claude_fpr=$(get_fpr /home/claude/.ssh/id_ed25519.pub)
@@ -805,7 +1009,7 @@ generate_report() {
         claude_source="pre-existing on node (from earlier run; privkey NOT shown)"
     fi
 
-    # ── Build FULL report → $REPORT_FILE (not stdout by default; too big for chat copy)
+    # ── Build FULL report → $REPORT_FILE
     {
         cat <<EOF
 ═══════════════════════════════════════════════════════════════════
@@ -851,16 +1055,26 @@ generate_report() {
   timezone          = $(timedatectl 2>/dev/null | awk -F: '/Time zone/ {gsub(/^[ \t]+/, "", $2); print $2}' | head -c 40)
   chrony_synced     = $(get_chrony_synced)
 
+[SYSTEM HARDENING]
+  applied           = $HARDENING_APPLIED
+  sysctl_file       = $SYSCTL_FILE
+  limits_file       = $LIMITS_FILE
+  journald          = SystemMaxUse=1G, MaxFileSec=1week
+  needrestart       = non-interactive
+  unattended_reboot = disabled
+  nf_conntrack      = $(lsmod 2>/dev/null | awk '/^nf_conntrack / {print "loaded"; exit} END {if (!/^nf_conntrack / ) print "?"}')
+
+[DOCKER]
+  status            = $DOCKER_STATUS
+
 [SOFTWARE — INSTALLED]
 EOF
 
-        # Installed OK packages
         for entry in "${INSTALLED_OK[@]}"; do
             IFS='|' read -r pkg ver <<< "$entry"
             printf '  %-24s %-30s ✓\n' "$pkg" "$ver"
         done
 
-        # Failed packages
         echo ""
         echo "[SOFTWARE — FAILED]"
         if [[ ${#INSTALLED_FAIL[@]} -eq 0 ]]; then
@@ -900,7 +1114,6 @@ EOF
     ssh             = DISABLED (PermitRootLogin no)
 EOF
 
-        # Claude private key — shown only on first generation
         if [[ -n "$GENERATED_CLAUDE_PRIVKEY" ]]; then
             cat <<'PRIVKEY_BANNER'
 
@@ -924,6 +1137,9 @@ PRIVKEY_BANNER
   PubkeyAuthentication    = yes
   MaxAuthTries            = 3
   LoginGraceTime          = 30s
+  ClientAliveInterval     = 300
+  ClientAliveCountMax     = 2
+  AllowAgentForwarding    = no
   Claude override         = Match User claude → publickey only
 
 [FIREWALL — nftables]
@@ -981,21 +1197,26 @@ EOF
             failed_pkgs=" failed=$(IFS=,; echo "${INSTALLED_FAIL[*]%|*}")"
         fi
 
+        local docker_line=""
+        if [[ "$ROLE" == "ru-node" ]]; then
+            docker_line="  docker=$DOCKER_STATUS"$'\n'
+        fi
+
         cat <<EOF
-─── PREP REPORT ──────────────────────────────────────────────
-  role=$ROLE  host=$(hostname)  v$SCRIPT_VERSION  run=$run_count
+─── PREP REPORT v$SCRIPT_VERSION ─────────────────────────────
+  role=$ROLE  host=$(hostname)  run=$run_count
   ipv4=${ipv4:-n/a}  ipv6=${ipv6:-n/a}  iface=${iface:-n/a}  icmpv6=$(check_icmpv6)
   hw=$(nproc)c/$(get_ram_total_mb)M/$(get_disk_root_total)  virt=$(get_virtualization)  kern=$(get_kernel)
-  os=$(get_distro)  chrony=$(chronyc tracking 2>/dev/null | awk -F: '/Leap status/{gsub(/^ /,"",$2);print $2;exit}' || echo unknown)
+  os=$(get_distro)  chrony=$(get_chrony_synced)
   pkgs=${pkg_ok}/${pkg_total} ok${failed_pkgs}
-  admin_user=admin  admin_pw=${ADMIN_PASSWORD_NEW}
+  hardening=${HARDENING_APPLIED}
+${docker_line}  admin_user=admin  admin_pw=${ADMIN_PASSWORD_NEW}
   claude_fpr=$claude_fpr
-  ssh: port=22  root=off  claude=pubkey-only  whitelist=${ssh_wl}
+  ssh: port=22  root=off  claude=pubkey-only  client_alive=300/2  whitelist=${ssh_wl}
   fail2ban=$(systemctl is-active fail2ban 2>/dev/null || echo ?)  nftables=$(systemctl is-active nftables 2>/dev/null || echo ?)
   connect: ssh -i ~/.ssh/id_claude_$(hostname) claude@${ipv4%/*}
 EOF
 
-        # Print privkey only when it was generated this run (first-time)
         if [[ -n "$GENERATED_CLAUDE_PRIVKEY" ]]; then
             echo "  claude_privkey (save to ~/.ssh/id_claude_$(hostname), chmod 600, shown ONCE):"
             printf '%s\n' "$GENERATED_CLAUDE_PRIVKEY" | sed 's/^/    /'
@@ -1025,24 +1246,26 @@ main() {
 
     log "═══════════════════════════════════════════════════════════════"
     log " prepare-node.sh v${SCRIPT_VERSION}"
-    log " role=${ROLE} hostname=${HOSTNAME_NEW:-<unchanged>} dry_run=${DRY_RUN}"
+    log " role=${ROLE} hostname=${HOSTNAME_NEW:-<unchanged>} steps=${TOTAL_STEPS} dry_run=${DRY_RUN}"
     log "═══════════════════════════════════════════════════════════════"
 
     pre_checks
     set_hostname
     apt_update_security
     install_base_software
+    apply_system_hardening
     setup_chrony
     setup_nftables
     setup_fail2ban
     create_user_admin
     create_user_claude
     harden_ssh
+    install_docker      # skipped for role=exit
     generate_report
 
     log ""
     log "DONE. Report also saved to: $REPORT_FILE"
-    log "Next: copy report to Claude chat. See [NEXT STEPS] in the report."
+    log "Next: copy compact report to Claude chat. See [NEXT STEPS] in the report."
 }
 
 main "$@"
