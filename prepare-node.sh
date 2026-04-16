@@ -28,7 +28,7 @@ IFS=$'\n\t'
 #  Constants
 # ══════════════════════════════════════════════════════════════════════════════
 
-readonly SCRIPT_VERSION="1.0.1"
+readonly SCRIPT_VERSION="1.0.2"
 readonly SCRIPT_NAME="prepare-node.sh"
 
 readonly STATE_DIR="/var/lib/node-prep"
@@ -67,6 +67,7 @@ ADMIN_PUBKEY=""
 CLAUDE_PUBKEY=""
 OFFICE_IPS=""
 DRY_RUN=false
+VERBOSE_REPORT=false
 
 # Runtime state
 INSTALLED_OK=()
@@ -136,6 +137,10 @@ Optional:
                               and a warning is emitted in the report.
                               Example: '1.2.3.4,5.6.7.0/24,2001:db8::/64'
   --dry-run                   Print plan without making changes.
+  --verbose-report            Print the FULL report to stdout at the end.
+                              By default a compact summary is printed; the
+                              full report is always saved to
+                              /root/node-prep-report.txt.
   --help, -h                  Show this help and exit.
 
 Examples:
@@ -156,6 +161,7 @@ parse_args() {
             --claude-pubkey) CLAUDE_PUBKEY="${2:-}"; shift 2 ;;
             --office-ips)    OFFICE_IPS="${2:-}";    shift 2 ;;
             --dry-run)       DRY_RUN=true;           shift   ;;
+            --verbose-report) VERBOSE_REPORT=true;   shift   ;;
             --help|-h)       usage; exit 0 ;;
             *) err "Unknown argument: $1"; usage; exit 1 ;;
         esac
@@ -664,11 +670,15 @@ get_gw_v4() { ip -4 route show default 2>/dev/null | awk '{print $3; exit}'; }
 get_gw_v6() { ip -6 route show default 2>/dev/null | awk '{print $3; exit}'; }
 
 get_resolvers() {
+    local src=""
     if [[ -f /run/systemd/resolve/resolv.conf ]]; then
-        awk '/^nameserver/ {print $2}' /run/systemd/resolve/resolv.conf | paste -sd ',' -
+        src=/run/systemd/resolve/resolv.conf
     elif [[ -f /etc/resolv.conf ]]; then
-        awk '/^nameserver/ {print $2}' /etc/resolv.conf | paste -sd ',' -
+        src=/etc/resolv.conf
     fi
+    [[ -z "$src" ]] && return
+    # Deduplicate preserving order
+    awk '/^nameserver/ && !seen[$2]++ {print $2}' "$src" | paste -sd ',' -
 }
 
 check_icmpv6() {
@@ -686,7 +696,13 @@ get_cpu_model() {
 }
 
 get_cpu_mhz() {
-    lscpu | awk -F: '/CPU max MHz|CPU MHz/ {sub(/^[ \t]+/, "", $2); print int($2); exit}'
+    local mhz
+    mhz=$(lscpu | awk -F: '/CPU max MHz|CPU MHz/ {sub(/^[ \t]+/, "", $2); print int($2); exit}')
+    if [[ -z "$mhz" || "$mhz" == "0" ]]; then
+        # Fallback: read from /proc/cpuinfo (some virtualized CPUs miss it in lscpu)
+        mhz=$(awk '/cpu MHz/ {print int($4); exit}' /proc/cpuinfo)
+    fi
+    echo "${mhz:-unknown}"
 }
 
 get_ram_total_mb() { awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo; }
@@ -789,7 +805,7 @@ generate_report() {
         claude_source="pre-existing on node (from earlier run; privkey NOT shown)"
     fi
 
-    # ── Build report
+    # ── Build FULL report → $REPORT_FILE (not stdout by default; too big for chat copy)
     {
         cat <<EOF
 ═══════════════════════════════════════════════════════════════════
@@ -945,12 +961,59 @@ EOF
   END OF REPORT
 ═══════════════════════════════════════════════════════════════════
 EOF
-    } | tee "$REPORT_FILE"
+    } > "$REPORT_FILE"
 
     if [[ "$DRY_RUN" == "false" ]]; then
         chmod 600 "$REPORT_FILE"
     fi
-    ok "Report generated: $REPORT_FILE"
+
+    # ── Build COMPACT report for stdout (for chat paste)
+    {
+        local pkg_ok="${#INSTALLED_OK[@]}"
+        local pkg_fail="${#INSTALLED_FAIL[@]}"
+        local pkg_total=$((pkg_ok + pkg_fail))
+
+        local ssh_wl
+        if [[ -z "$OFFICE_IPS" ]]; then ssh_wl="ANY ⚠️"; else ssh_wl="$OFFICE_IPS"; fi
+
+        local failed_pkgs=""
+        if [[ $pkg_fail -gt 0 ]]; then
+            failed_pkgs=" failed=$(IFS=,; echo "${INSTALLED_FAIL[*]%|*}")"
+        fi
+
+        cat <<EOF
+─── PREP REPORT ──────────────────────────────────────────────
+  role=$ROLE  host=$(hostname)  v$SCRIPT_VERSION  run=$run_count
+  ipv4=${ipv4:-n/a}  ipv6=${ipv6:-n/a}  iface=${iface:-n/a}  icmpv6=$(check_icmpv6)
+  hw=$(nproc)c/$(get_ram_total_mb)M/$(get_disk_root_total)  virt=$(get_virtualization)  kern=$(get_kernel)
+  os=$(get_distro)  chrony=$(chronyc tracking 2>/dev/null | awk -F: '/Leap status/{gsub(/^ /,"",$2);print $2;exit}' || echo unknown)
+  pkgs=${pkg_ok}/${pkg_total} ok${failed_pkgs}
+  admin_user=admin  admin_pw=${ADMIN_PASSWORD_NEW}
+  claude_fpr=$claude_fpr
+  ssh: port=22  root=off  claude=pubkey-only  whitelist=${ssh_wl}
+  fail2ban=$(systemctl is-active fail2ban 2>/dev/null || echo ?)  nftables=$(systemctl is-active nftables 2>/dev/null || echo ?)
+  connect: ssh -i ~/.ssh/id_claude_$(hostname) claude@${ipv4%/*}
+EOF
+
+        # Print privkey only when it was generated this run (first-time)
+        if [[ -n "$GENERATED_CLAUDE_PRIVKEY" ]]; then
+            echo "  claude_privkey (save to ~/.ssh/id_claude_$(hostname), chmod 600, shown ONCE):"
+            printf '%s\n' "$GENERATED_CLAUDE_PRIVKEY" | sed 's/^/    /'
+        fi
+
+        cat <<EOF
+  full_report=$REPORT_FILE (on this node)
+──────────────────────────────────────────────────────────────
+EOF
+    } | tee -a "$LOG_FILE"
+
+    if [[ "$VERBOSE_REPORT" == "true" ]]; then
+        echo ""
+        echo "─── FULL REPORT (--verbose-report) ───"
+        cat "$REPORT_FILE"
+    fi
+
+    ok "Compact report above. Full report: $REPORT_FILE"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
