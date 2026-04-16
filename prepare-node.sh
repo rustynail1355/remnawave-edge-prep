@@ -28,7 +28,7 @@ IFS=$'\n\t'
 #  Constants
 # ══════════════════════════════════════════════════════════════════════════════
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.0.1"
 readonly SCRIPT_NAME="prepare-node.sh"
 
 readonly STATE_DIR="/var/lib/node-prep"
@@ -99,6 +99,17 @@ run() {
     else
         "$@"
     fi
+}
+
+# Run a command quietly: redirect both stdout and stderr to $LOG_FILE.
+# Used for noisy commands (apt, unattended-upgrade) to keep the main stdout
+# clean for the final report.
+run_quiet() {
+    if [[ "$DRY_RUN" == "true" ]]; then
+        printf '[DRY-RUN] would run (quiet): %s\n' "$*" >&2
+        return 0
+    fi
+    "$@" >>"$LOG_FILE" 2>&1
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -261,13 +272,14 @@ set_hostname() {
 
 apt_update_security() {
     log "Step 3/11: apt update + security upgrades"
+    log "  (apt output suppressed; see $LOG_FILE for details)"
 
     export DEBIAN_FRONTEND=noninteractive
-    run apt-get update -q
+    run_quiet apt-get update -qq
 
     # Security upgrades (best-effort; continue on failure)
     if command -v unattended-upgrade >/dev/null 2>&1; then
-        run unattended-upgrade --verbose || warn "unattended-upgrade returned non-zero"
+        run_quiet unattended-upgrade || warn "unattended-upgrade returned non-zero"
     else
         log "  unattended-upgrade not yet installed (will be installed in step 4)"
     fi
@@ -281,12 +293,15 @@ apt_update_security() {
 
 install_base_software() {
     log "Step 4/11: Install base software (${#BASE_PACKAGES[@]} packages)"
+    log "  (apt output suppressed; see $LOG_FILE for details, may take 1-3 min)"
 
     export DEBIAN_FRONTEND=noninteractive
 
     # Install all at once (faster, apt handles deps together)
     if [[ "$DRY_RUN" == "false" ]]; then
-        apt-get install -y --no-install-recommends "${BASE_PACKAGES[@]}" \
+        apt-get install -yqq --no-install-recommends \
+            -o Dpkg::Use-Pty=0 \
+            "${BASE_PACKAGES[@]}" >>"$LOG_FILE" 2>&1 \
             || warn "apt-get install returned non-zero (individual pkg status will be checked)"
     else
         printf '[DRY-RUN] would install: %s\n' "${BASE_PACKAGES[*]}" >&2
